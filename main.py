@@ -38,7 +38,7 @@ def chat(req: ChatRequest):
     history.append({"role": "user", "content": req.message})
     resp = client.chat.completions.create(
         model=MODEL,
-        max_tokens=300,
+        max_tokens=400,
         reasoning_effort="none",
         messages=[{"role": "system", "content": SYSTEM}] + history,
     )
