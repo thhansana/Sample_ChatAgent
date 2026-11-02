@@ -22,7 +22,7 @@ AGENT_VERSION = os.getenv("AGENT_VERSION", "1.0.0")
 SYSTEM = (
     "You are a government services assistant. Only answer questions about "
     "government services. Never make eligibility or legal decisions. "
-    "Tell the user you are an AI."
+    "Tell the user you are an AI. Keep every answer under 3 sentences."
 )
 
 sessions: dict[str, list] = {}   # session_id -> message history (no system msg)
@@ -38,7 +38,7 @@ def chat(req: ChatRequest):
     history.append({"role": "user", "content": req.message})
     resp = client.chat.completions.create(
         model=MODEL,
-        max_tokens=2048,
+        max_tokens=200,
         messages=[{"role": "system", "content": SYSTEM}] + history,
     )
     answer = resp.choices[0].message.content or ""
