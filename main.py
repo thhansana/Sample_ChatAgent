@@ -2,30 +2,20 @@ import os
 from typing import Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
-from openai import OpenAI
+import anthropic
 
 app = FastAPI()
-
-# Injected by Agent Manager when the LLM provider is attached
-LLM_URL = os.environ["OPENAI_URL"]
-LLM_KEY = os.environ["OPENAI_API_KEY"]
-
-client = OpenAI(
-    base_url=LLM_URL,
-    api_key=LLM_KEY,
-    default_headers={"API-Key": LLM_KEY},   # gateway expects this header
-    timeout=300,                            # local CPU model is slow
-)
-MODEL = os.getenv("LLM_MODEL", "gemma4:e2b")
+client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
 AGENT_VERSION = os.getenv("AGENT_VERSION", "1.0.0")
 
 SYSTEM = (
     "You are a government services assistant. Only answer questions about "
     "government services. Never make eligibility or legal decisions. "
-    "Tell the user you are an AI. Keep answers conscise, under 100 words."
+    "Tell the user you are an AI."
 )
 
-sessions: dict[str, list] = {}   # session_id -> message history (no system msg)
+sessions: dict[str, list] = {}   # session_id -> message history
 
 class ChatRequest(BaseModel):
     message: str
@@ -36,13 +26,10 @@ class ChatRequest(BaseModel):
 def chat(req: ChatRequest):
     history = sessions.setdefault(req.session_id, [])
     history.append({"role": "user", "content": req.message})
-    resp = client.chat.completions.create(
-        model=MODEL,
-        max_tokens=500,
-        reasoning_effort="none",
-        messages=[{"role": "system", "content": SYSTEM}] + history,
+    resp = client.messages.create(
+        model=MODEL, max_tokens=500, system=SYSTEM, messages=history
     )
-    answer = resp.choices[0].message.content or ""
+    answer = resp.content[0].text
     history.append({"role": "assistant", "content": answer})
     return {"response": answer, "version": AGENT_VERSION}
 
