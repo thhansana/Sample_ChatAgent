@@ -12,7 +12,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from pydantic import BaseModel
 
-log = logging.getLogger("chat-agent")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("agent")
 
 app = FastAPI()
 client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -20,9 +21,11 @@ MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
 AGENT_VERSION = os.getenv("AGENT_VERSION", "1.2.0")
 
 # Injected by Agent Manager when the MCP proxy is attached to this agent (names are configurable there).
-MCP_URL = os.getenv("MCP_SERVER_URL")
-MCP_KEY = os.getenv("MCP_SERVER_API_KEY")
-MCP_AUTH_HEADER = os.getenv("MCP_AUTH_HEADER", "x-api-key")   # must match the proxy's Security tab
+# The console may inject several comma-separated URLs; this agent uses the first one.
+MCP_URL = (os.getenv("MCP_SERVER_URL") or "").split(",")[0].strip() or None
+MCP_KEY = (os.getenv("MCP_SERVER_API_KEY") or "").strip() or None
+MCP_AUTH_HEADER = os.getenv("MCP_AUTH_HEADER", "X-API-Key")   # must match the proxy's Security tab
+log.info("MCP proxy URL: %s | API key set: %s", MCP_URL, bool(MCP_KEY))
 
 # The model only ever sees these tools. The gateway policy is the real control; this is a second belt.
 ALLOWED_TOOLS = {"list_agencies", "read_record", "write_field"}
@@ -70,6 +73,13 @@ class ChatRequest(BaseModel):
 
 def _text(content) -> str:
     return "".join(b.text for b in content if getattr(b, "type", "") == "text").strip()
+
+
+def _root(e: BaseException) -> BaseException:
+    """The MCP client wraps errors in ExceptionGroups; dig out the real one."""
+    while getattr(e, "exceptions", None):
+        e = e.exceptions[0]
+    return e
 
 
 def _redact(args: dict) -> dict:
@@ -138,7 +148,9 @@ async def _chat(req: ChatRequest, session_id: str):
         history.append({"role": "assistant", "content": resp.content})
         return {"response": _text(resp.content), "version": AGENT_VERSION, "tool_calls": tool_calls}
 
-    headers = {MCP_AUTH_HEADER: MCP_KEY} if MCP_KEY else {}
+    # The console's own snippet sends "API-Key"; the proxy's Security tab shows the header it checks.
+    # Send both until it is confirmed which one the gateway uses, then drop the other.
+    headers = {MCP_AUTH_HEADER: MCP_KEY, "API-Key": MCP_KEY} if MCP_KEY else {}
     try:
         async with streamablehttp_client(MCP_URL, headers=headers) as (read, write, _):
             async with ClientSession(read, write) as mcp:
@@ -201,10 +213,12 @@ async def _chat(req: ChatRequest, session_id: str):
                     answer = "I could not finish that request within the allowed number of steps."
         return {"response": answer, "version": AGENT_VERSION, "tool_calls": tool_calls}
     except Exception as e:
-        log.exception("chat turn failed")
         del history[start:]
-        return {"response": f"The data exchange is unavailable right now ({type(e).__name__}). "
-                            "Please try again.", "version": AGENT_VERSION, "tool_calls": tool_calls}
+        root = _root(e)
+        log.exception("MCP call failed: %r", root)
+        return {"response": f"The data exchange is unavailable right now ({type(root).__name__}: "
+                            f"{str(root)[:160]}). Please try again.",
+                "version": AGENT_VERSION, "tool_calls": tool_calls}
 
 
 if __name__ == "__main__":
