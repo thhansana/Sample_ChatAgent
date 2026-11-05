@@ -1,3 +1,4 @@
 fastapi
 uvicorn
 anthropic
+mcp<2
