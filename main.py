@@ -18,7 +18,7 @@ log = logging.getLogger("agent")
 app = FastAPI()
 client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.3.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.4.0")
 
 # Injected by Agent Manager when the MCP proxy is attached to this agent (names are configurable there).
 # The console may inject several comma-separated URLs; this agent uses the first one.
@@ -56,9 +56,7 @@ SYSTEM = (
     "Tell the user you are an AI.\n\n"
     "You can use tools to read residents' records from State agencies and to change one field. "
     "Rules:\n"
-    "- Reads need the resident's consent. If a read fails with 'No consent on file', tell the user. "
-    "You cannot record consent. Give them this command to run in WSL: "
-    "python3 demo_tools.py consent {resident_id} vehicle,elections,tax \"<purpose>\"\n"
+    "- Reads and writes need the resident's consent. {consent_rule}\n"
     "- Never write without the user's explicit confirmation of the exact change.\n"
     "- A write also needs the citizen's eID approval, which you cannot create and never see. After the user "
     "confirms, give them this command: python3 demo_tools.py token {resident_id} {session_id} --count N "
@@ -68,6 +66,19 @@ SYSTEM = (
     "- Each agency needs its own write_field call, and each call uses up one approval.\n"
     "- If write_field says no eID approval is on file, ask the user to run the token command again and paste it.\n"
     "- If a tool returns ok=false, report the agency's reason plainly and do not retry with different values."
+)
+
+# How the user grants consent. In the portal a consent card appears by itself when a tool reports
+# 'No consent on file'; without the portal (Agent Manager "Try it") the user runs a command.
+CONSENT_PORTAL = (
+    "If a tool fails with 'No consent on file', tell the user in one or two sentences that a consent request "
+    "is now waiting for them in the portal (the 'Waiting for you' panel on the left), and that once they "
+    "approve it you will continue. You cannot record consent. Do not tell them to run any command and do "
+    "not retry until they say they have approved."
+)
+CONSENT_CMD = (
+    "If a tool fails with 'No consent on file', tell the user. You cannot record consent. Give them this "
+    "command to run in WSL: python3 demo_tools.py consent {resident_id} vehicle,elections,tax \"<purpose>\""
 )
 
 sessions: dict[str, list] = {}      # session_id -> message history
@@ -162,7 +173,8 @@ async def _chat(req: ChatRequest, session_id: str):
     history.append({"role": "user", "content": _extract_approvals(session_id, req.message)})
     resident = _bind_resident(session_id, req.context)
     hidden = AGENT_SUPPLIED | ({"resident_id"} if resident else set())
-    system = (SYSTEM.replace("{session_id}", session_id)
+    system = (SYSTEM.replace("{consent_rule}", CONSENT_PORTAL if resident else CONSENT_CMD)
+              .replace("{session_id}", session_id)
               .replace("{resident_id}", resident["resident_id"] if resident else "<resident_id>"))
     if resident:
         system += RESIDENT_NOTE.format(**resident)
