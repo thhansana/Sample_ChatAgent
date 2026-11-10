@@ -18,7 +18,7 @@ log = logging.getLogger("agent")
 app = FastAPI()
 client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.4.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.5.0")
 
 # Injected by Agent Manager when the MCP proxy is attached to this agent (names are configurable there).
 # The console may inject several comma-separated URLs; this agent uses the first one.
@@ -45,8 +45,10 @@ RESIDENT_NOTE = (
     "records or changes, decline and explain that you can only help with their own."
 )
 
-# The demo has no portal, so the citizen pastes the lines printed by `demo_tools.py token` into the chat.
-# The agent pulls them out of the message before the model sees it and attaches them to write calls.
+# Approvals reach the agent as 'change_id=... assurance_token=...' in a user message: the portal server sends
+# them after the resident approves with their PIN (without the portal, the citizen pastes the lines printed
+# by `demo_tools.py token`). The agent pulls them out before the model sees the message and attaches them
+# to write calls.
 APPROVAL_RE = re.compile(r"change_id=(\S+)\s+assurance_token=(\S+)")
 APPROVAL_MARK = "[eID approval received]"
 
@@ -58,14 +60,30 @@ SYSTEM = (
     "Rules:\n"
     "- Reads and writes need the resident's consent. {consent_rule}\n"
     "- Never write without the user's explicit confirmation of the exact change.\n"
-    "- A write also needs the citizen's eID approval, which you cannot create and never see. After the user "
-    "confirms, give them this command: python3 demo_tools.py token {resident_id} {session_id} --count N "
-    "(N = the number of agencies being changed) and ask them to paste the printed lines into the chat. "
-    "When they do, the message shows as '" + APPROVAL_MARK + "' and the system attaches one approval to each "
-    "write_field call for you. Do not ask for, type or repeat any token.\n"
+    "- A write also needs the citizen's eID approval, which you cannot create and never see. {approval_rule}\n"
     "- Each agency needs its own write_field call, and each call uses up one approval.\n"
-    "- If write_field says no eID approval is on file, ask the user to run the token command again and paste it.\n"
     "- If a tool returns ok=false, report the agency's reason plainly and do not retry with different values."
+)
+
+# How the user gives the eID approval. In the portal a card with the exact change and a PIN field appears by
+# itself when write_field reports 'No eID approval on file'; without the portal the user runs a command.
+APPROVAL_PORTAL = (
+    "In the portal, the approval card shows the resident the exact change and asks for their eID PIN, so that "
+    "card is their confirmation. Once you know the agency, the field and the exact new value, call write_field "
+    "straight away; never guess a value. If you have not read that agency's record in this conversation yet, "
+    "read it first. The first write_field call will fail with 'No eID approval on file'. That is expected: "
+    "tell the user in one or two sentences that an approval request is now waiting in the portal (the 'Waiting "
+    "for you' panel on the left) and that you will make the change once they approve it. Do not tell them to "
+    "run any command, and do not retry until a message shows '" + APPROVAL_MARK + "'. When it does, call "
+    "write_field again with the same values; the system attaches the approval for you. Do not ask for, type "
+    "or repeat any token."
+)
+APPROVAL_CMD = (
+    "After the user confirms, give them this command: python3 demo_tools.py token {resident_id} {session_id} "
+    "--count N (N = the number of agencies being changed) and ask them to paste the printed lines into the "
+    "chat. When they do, the message shows as '" + APPROVAL_MARK + "' and the system attaches one approval to "
+    "each write_field call for you. Do not ask for, type or repeat any token. If write_field says no eID "
+    "approval is on file, ask the user to run the token command again and paste it."
 )
 
 # How the user grants consent. In the portal a consent card appears by itself when a tool reports
@@ -174,6 +192,7 @@ async def _chat(req: ChatRequest, session_id: str):
     resident = _bind_resident(session_id, req.context)
     hidden = AGENT_SUPPLIED | ({"resident_id"} if resident else set())
     system = (SYSTEM.replace("{consent_rule}", CONSENT_PORTAL if resident else CONSENT_CMD)
+              .replace("{approval_rule}", APPROVAL_PORTAL if resident else APPROVAL_CMD)
               .replace("{session_id}", session_id)
               .replace("{resident_id}", resident["resident_id"] if resident else "<resident_id>"))
     if resident:
@@ -236,9 +255,13 @@ async def _chat(req: ChatRequest, session_id: str):
                         if "assurance_token" in props:
                             queue = approvals.get(session_id) or []
                             if not queue:
+                                # The portal looks for this exact start of the message to raise an approval card.
+                                hint = ("An approval request is now waiting for the resident in the portal. "
+                                        "Tell them, and wait until they approve it." if resident else
+                                        "Ask the user to run the token command and paste the printed lines "
+                                        "into the chat.")
                                 body = json.dumps({"ok": False, "error": "No eID approval on file for this "
-                                                   "session. Ask the user to run the token command and paste "
-                                                   "the printed lines into the chat."})
+                                                   "session. " + hint})
                                 tool_calls.append({"tool": block.name, "arguments": _redact(args), "result": body})
                                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                                 "content": body, "is_error": True})
