@@ -18,7 +18,7 @@ log = logging.getLogger("agent")
 app = FastAPI()
 client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.2.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.3.0")
 
 # Injected by Agent Manager when the MCP proxy is attached to this agent (names are configurable there).
 # The console may inject several comma-separated URLs; this agent uses the first one.
@@ -35,6 +35,16 @@ MAX_STEPS = 6
 # model never chooses or handles them (MCP_SCOPE section 7: the assistant never sees the eID token).
 AGENT_SUPPLIED = {"session_id", "assurance_token", "change_id"}
 
+# When the portal tells us who is signed in (context.resident_id), the agent also fixes resident_id on every
+# tool call and hides it from the model, so the model cannot read or change another resident's records.
+# Without a signed-in resident (for example the Agent Manager "Try it" page) the model supplies it as before.
+RESIDENT_RE = re.compile(r"[A-Za-z0-9-]{1,32}")
+RESIDENT_NOTE = (
+    "\n\nYou are assisting {name} (resident ID {resident_id}), who is signed in to the portal. Every tool call "
+    "already acts on this resident, so never ask for a resident ID. If the user asks about another person's "
+    "records or changes, decline and explain that you can only help with their own."
+)
+
 # The demo has no portal, so the citizen pastes the lines printed by `demo_tools.py token` into the chat.
 # The agent pulls them out of the message before the model sees it and attaches them to write calls.
 APPROVAL_RE = re.compile(r"change_id=(\S+)\s+assurance_token=(\S+)")
@@ -48,10 +58,10 @@ SYSTEM = (
     "Rules:\n"
     "- Reads need the resident's consent. If a read fails with 'No consent on file', tell the user. "
     "You cannot record consent. Give them this command to run in WSL: "
-    "python3 demo_tools.py consent <resident_id> vehicle,elections,tax \"<purpose>\"\n"
+    "python3 demo_tools.py consent {resident_id} vehicle,elections,tax \"<purpose>\"\n"
     "- Never write without the user's explicit confirmation of the exact change.\n"
     "- A write also needs the citizen's eID approval, which you cannot create and never see. After the user "
-    "confirms, give them this command: python3 demo_tools.py token <resident_id> {session_id} --count N "
+    "confirms, give them this command: python3 demo_tools.py token {resident_id} {session_id} --count N "
     "(N = the number of agencies being changed) and ask them to paste the printed lines into the chat. "
     "When they do, the message shows as '" + APPROVAL_MARK + "' and the system attaches one approval to each "
     "write_field call for you. Do not ask for, type or repeat any token.\n"
@@ -62,6 +72,7 @@ SYSTEM = (
 
 sessions: dict[str, list] = {}      # session_id -> message history
 approvals: dict[str, list] = {}     # session_id -> [(change_id, token)], never shown to the model
+residents: dict[str, dict] = {}     # session_id -> {"resident_id", "name"} from the portal
 _locks: dict[str, asyncio.Lock] = {}
 
 
@@ -94,13 +105,31 @@ def _extract_approvals(session_id: str, message: str) -> str:
     return APPROVAL_RE.sub(APPROVAL_MARK, message)
 
 
-def _model_schema(schema: dict) -> dict:
+def _bind_resident(session_id: str, context: Optional[dict]) -> Optional[dict]:
+    """The resident this session belongs to, from the portal's context. The first one sticks:
+    a later request cannot switch a session to a different resident."""
+    bound = residents.get(session_id)
+    rid = str((context or {}).get("resident_id") or "").strip()
+    if not RESIDENT_RE.fullmatch(rid):
+        return bound
+    if bound:
+        if bound["resident_id"] != rid:
+            log.warning("Ignoring resident_id %s for session %s: it is bound to %s", rid, session_id,
+                        bound["resident_id"])
+        return bound
+    name = re.sub(r"[^\w .'-]", "", str((context or {}).get("name") or ""))[:60].strip() or "the resident"
+    residents[session_id] = {"resident_id": rid, "name": name}
+    log.info("Session %s bound to resident %s", session_id, rid)
+    return residents[session_id]
+
+
+def _model_schema(schema: dict, hidden: set) -> dict:
     """The schema the model sees: the agent-supplied parameters are removed."""
     out = copy.deepcopy(schema)
-    for name in AGENT_SUPPLIED:
+    for name in hidden:
         out.get("properties", {}).pop(name, None)
     if "required" in out:
-        out["required"] = [r for r in out["required"] if r not in AGENT_SUPPLIED]
+        out["required"] = [r for r in out["required"] if r not in hidden]
     return out
 
 
@@ -131,7 +160,12 @@ async def _chat(req: ChatRequest, session_id: str):
     history = sessions.setdefault(session_id, [])
     start = len(history)
     history.append({"role": "user", "content": _extract_approvals(session_id, req.message)})
-    system = SYSTEM.replace("{session_id}", session_id)
+    resident = _bind_resident(session_id, req.context)
+    hidden = AGENT_SUPPLIED | ({"resident_id"} if resident else set())
+    system = (SYSTEM.replace("{session_id}", session_id)
+              .replace("{resident_id}", resident["resident_id"] if resident else "<resident_id>"))
+    if resident:
+        system += RESIDENT_NOTE.format(**resident)
     tool_calls = []
 
     def unavailable(e: Exception):
@@ -158,7 +192,7 @@ async def _chat(req: ChatRequest, session_id: str):
                 listed = await mcp.list_tools()
                 full_schemas = {t.name: t.inputSchema for t in listed.tools if t.name in ALLOWED_TOOLS}
                 tools = [{"name": t.name, "description": t.description or "",
-                          "input_schema": _model_schema(t.inputSchema)}
+                          "input_schema": _model_schema(t.inputSchema, hidden)}
                          for t in listed.tools if t.name in ALLOWED_TOOLS]
                 answer = None
                 for _step in range(MAX_STEPS):
@@ -181,9 +215,11 @@ async def _chat(req: ChatRequest, session_id: str):
                             continue
                         props = full_schemas.get(block.name, {}).get("properties", {})
                         # Whatever the model sent for agent-supplied parameters is discarded.
-                        args = {k: v for k, v in dict(block.input).items() if k not in AGENT_SUPPLIED}
+                        args = {k: v for k, v in dict(block.input).items() if k not in hidden}
                         if "session_id" in props:
                             args["session_id"] = session_id   # always the real session, never model-chosen
+                        if resident and "resident_id" in props:
+                            args["resident_id"] = resident["resident_id"]   # always the signed-in resident
                         approval = None
                         if "assurance_token" in props:
                             queue = approvals.get(session_id) or []
