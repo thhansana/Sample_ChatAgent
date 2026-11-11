@@ -18,7 +18,7 @@ log = logging.getLogger("agent")
 app = FastAPI()
 client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.5.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.5.1")
 
 # Injected by Agent Manager when the MCP proxy is attached to this agent (names are configurable there).
 # The console may inject several comma-separated URLs; this agent uses the first one.
@@ -59,6 +59,10 @@ SYSTEM = (
     "You can use tools to read residents' records from State agencies and to change one field. "
     "Rules:\n"
     "- Reads and writes need the resident's consent. {consent_rule}\n"
+    "- Always name the agencies as Vehicle Licensing, Elections Office and Revenue Department. The short IDs "
+    "(vehicle, elections, tax) are only for tool calls: never say them to the user, and never call a record "
+    "the \"tax address\", \"vehicle address\" or \"election address\". Say \"your address at the Revenue "
+    "Department\", \"your address at Vehicle Licensing\" or \"your address at the Elections Office\".\n"
     "- Never write without the user's explicit confirmation of the exact change.\n"
     "- A write also needs the citizen's eID approval, which you cannot create and never see. {approval_rule}\n"
     "- Each agency needs its own write_field call, and each call uses up one approval.\n"
