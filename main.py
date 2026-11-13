@@ -18,7 +18,7 @@ log = logging.getLogger("agent")
 app = FastAPI()
 client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.5.1")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.6.0")
 
 # Injected by Agent Manager when the MCP proxy is attached to this agent (names are configurable there).
 # The console may inject several comma-separated URLs; this agent uses the first one.
@@ -58,7 +58,7 @@ SYSTEM = (
     "Tell the user you are an AI.\n\n"
     "You can use tools to read residents' records from State agencies and to change one field. "
     "Rules:\n"
-    "- Reads and writes need the resident's consent. {consent_rule}\n"
+    "- {consent_rule}\n"
     "- Always name the agencies as Vehicle Licensing, Elections Office and Revenue Department. The short IDs "
     "(vehicle, elections, tax) are only for tool calls: never say them to the user, and never call a record "
     "the \"tax address\", \"vehicle address\" or \"election address\". Say \"your address at the Revenue "
@@ -74,8 +74,7 @@ SYSTEM = (
 APPROVAL_PORTAL = (
     "In the portal, the approval card shows the resident the exact change and asks for their eID PIN, so that "
     "card is their confirmation. Once you know the agency, the field and the exact new value, call write_field "
-    "straight away; never guess a value. If you have not read that agency's record in this conversation yet, "
-    "read it first. The first write_field call will fail with 'No eID approval on file'. That is expected: "
+    "straight away; never guess a value. The first write_field call will fail with 'No eID approval on file'. That is expected: "
     "tell the user in one or two sentences that an approval request is now waiting in the portal (the 'Waiting "
     "for you' panel on the left) and that you will make the change once they approve it. Do not tell them to "
     "run any command, and do not retry until a message shows '" + APPROVAL_MARK + "'. When it does, call "
@@ -90,15 +89,25 @@ APPROVAL_CMD = (
     "approval is on file, ask the user to run the token command again and paste it."
 )
 
-# How the user grants consent. In the portal a consent card appears by itself when a tool reports
-# 'No consent on file'; without the portal (Agent Manager "Try it") the user runs a command.
+# Consent is off by default (the resident is already signed in; only changes need the eID approval). Set
+# REQUIRE_CONSENT=true here AND on the agency services to bring the consent step back.
+REQUIRE_CONSENT = os.getenv("REQUIRE_CONSENT", "false").strip().lower() in ("1", "true", "yes", "on")
+CONSENT_NONE = (
+    "Reading the signed-in resident's own records needs no consent or other permission, because they have "
+    "already signed in: never ask for consent, and never say that consent is required. Only changes need an "
+    "approval (below)."
+)
+# How the user grants consent when it is required. In the portal a consent card appears by itself when a tool
+# reports 'No consent on file'; without the portal (Agent Manager "Try it") the user runs a command.
 CONSENT_PORTAL = (
+    "Reads and writes need the resident's consent. "
     "If a tool fails with 'No consent on file', tell the user in one or two sentences that a consent request "
     "is now waiting for them in the portal (the 'Waiting for you' panel on the left), and that once they "
     "approve it you will continue. You cannot record consent. Do not tell them to run any command and do "
     "not retry until they say they have approved."
 )
 CONSENT_CMD = (
+    "Reads and writes need the resident's consent. "
     "If a tool fails with 'No consent on file', tell the user. You cannot record consent. Give them this "
     "command to run in WSL: python3 demo_tools.py consent {resident_id} vehicle,elections,tax \"<purpose>\""
 )
@@ -195,7 +204,8 @@ async def _chat(req: ChatRequest, session_id: str):
     history.append({"role": "user", "content": _extract_approvals(session_id, req.message)})
     resident = _bind_resident(session_id, req.context)
     hidden = AGENT_SUPPLIED | ({"resident_id"} if resident else set())
-    system = (SYSTEM.replace("{consent_rule}", CONSENT_PORTAL if resident else CONSENT_CMD)
+    consent_rule = CONSENT_NONE if not REQUIRE_CONSENT else (CONSENT_PORTAL if resident else CONSENT_CMD)
+    system = (SYSTEM.replace("{consent_rule}", consent_rule)
               .replace("{approval_rule}", APPROVAL_PORTAL if resident else APPROVAL_CMD)
               .replace("{session_id}", session_id)
               .replace("{resident_id}", resident["resident_id"] if resident else "<resident_id>"))
