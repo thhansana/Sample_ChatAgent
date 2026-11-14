@@ -75,8 +75,8 @@ APPROVAL_PORTAL = (
     "In the portal, the approval card shows the resident the exact change and asks for their eID PIN, so that "
     "card is their confirmation. Once you know the agency, the field and the exact new value, call write_field "
     "straight away; never guess a value. The first write_field call will fail with 'No eID approval on file'. That is expected: "
-    "tell the user in one or two sentences that an approval request is now waiting in the portal (the 'Waiting "
-    "for you' panel on the left) and that you will make the change once they approve it. Do not tell them to "
+    "tell the user in one or two sentences that an approval request is now open in the portal (a window asking "
+    "for their eID PIN) and that you will make the change once they approve it. Do not tell them to "
     "run any command, and do not retry until a message shows '" + APPROVAL_MARK + "'. When it does, call "
     "write_field again with the same values; the system attaches the approval for you. Do not ask for, type "
     "or repeat any token."
@@ -102,7 +102,7 @@ CONSENT_NONE = (
 CONSENT_PORTAL = (
     "Reads and writes need the resident's consent. "
     "If a tool fails with 'No consent on file', tell the user in one or two sentences that a consent request "
-    "is now waiting for them in the portal (the 'Waiting for you' panel on the left), and that once they "
+    "is now open in the portal (a window asking them to approve), and that once they "
     "approve it you will continue. You cannot record consent. Do not tell them to run any command and do "
     "not retry until they say they have approved."
 )
