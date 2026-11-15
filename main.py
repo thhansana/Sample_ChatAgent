@@ -18,7 +18,7 @@ log = logging.getLogger("agent")
 app = FastAPI()
 client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.6.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.7.0")
 
 # Injected by Agent Manager when the MCP proxy is attached to this agent (names are configurable there).
 # The console may inject several comma-separated URLs; this agent uses the first one.
@@ -39,10 +39,12 @@ AGENT_SUPPLIED = {"session_id", "assurance_token", "change_id"}
 # tool call and hides it from the model, so the model cannot read or change another resident's records.
 # Without a signed-in resident (for example the Agent Manager "Try it" page) the model supplies it as before.
 RESIDENT_RE = re.compile(r"[A-Za-z0-9-]{1,32}")
+# The note deliberately holds no name or ID: the model is an external service and does not need them
+# (the agent fills in resident_id on every call, and the portal greets the resident by name).
 RESIDENT_NOTE = (
-    "\n\nYou are assisting {name} (resident ID {resident_id}), who is signed in to the portal. Every tool call "
-    "already acts on this resident, so never ask for a resident ID. If the user asks about another person's "
-    "records or changes, decline and explain that you can only help with their own."
+    "\n\nThe user is a resident who is signed in to the portal. Every tool call already acts on this resident, "
+    "so never ask for a resident ID. If the user asks about another person's records or changes, decline and "
+    "explain that you can only help with their own."
 )
 
 # Approvals reach the agent as 'change_id=... assurance_token=...' in a user message: the portal server sends
@@ -59,6 +61,10 @@ SYSTEM = (
     "You can use tools to read residents' records from State agencies and to change one field. "
     "Rules:\n"
     "- {consent_rule}\n"
+    "- Personal details (names, addresses, phone numbers, plates, IDs) appear as placeholders such as "
+    "[ADDRESS_1] or [PHONE_1], in the conversation and in tool results. Write a placeholder exactly as given "
+    "when you mention the detail or pass it to a tool: the system replaces it with the real value for the "
+    "resident. Never guess, invent or change a placeholder, and never mention that placeholders exist.\n"
     "- Always name the agencies as Vehicle Licensing, Elections Office and Revenue Department. The short IDs "
     "(vehicle, elections, tax) are only for tool calls: never say them to the user, and never call a record "
     "the \"tax address\", \"vehicle address\" or \"election address\". Say \"your address at the Revenue "
@@ -117,6 +123,15 @@ approvals: dict[str, list] = {}     # session_id -> [(change_id, token)], never 
 residents: dict[str, dict] = {}     # session_id -> {"resident_id", "name"} from the portal
 _locks: dict[str, asyncio.Lock] = {}
 
+# Keeping personal details away from the model. The model is an external service, so the agent never sends it a
+# resident's details. Known values (the signed-in resident's name and ID, every field of an agency record) are
+# swapped for placeholders such as [ADDRESS_1] before anything goes to the model. The real values are put back
+# in what the agent returns to the portal and in the tool calls it makes. The map lives only in this process,
+# per session. Free text the resident types is only checked against values already known (exact match).
+PLACEHOLDER_RE = re.compile(r"\[[A-Z][A-Z0-9_]*_\d+\]")
+MIN_MASK_LEN = 4                    # shorter known values are not searched for in free text (too many false hits)
+vaults: dict[str, dict] = {}        # session_id -> {"real": {value: placeholder}, "ph": {placeholder: value}, "n": {label: count}}
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -165,6 +180,74 @@ def _bind_resident(session_id: str, context: Optional[dict]) -> Optional[dict]:
     return residents[session_id]
 
 
+def _placeholder(session_id: str, label: str, value) -> str:
+    """The placeholder for a real value in this session (the same value always gets the same one)."""
+    v = vaults.setdefault(session_id, {"real": {}, "ph": {}, "n": {}})
+    value = str(value)
+    if value in v["real"]:
+        return v["real"][value]
+    label = re.sub(r"[^A-Z0-9]+", "_", str(label).upper()).strip("_") or "VALUE"
+    v["n"][label] = v["n"].get(label, 0) + 1
+    ph = f"[{label}_{v['n'][label]}]"
+    v["real"][value], v["ph"][ph] = ph, value
+    return ph
+
+
+def _mask_text(session_id: str, text: str) -> str:
+    """Replace every known real value in the text with its placeholder (whole values, any letter case)."""
+    v = vaults.get(session_id)
+    values = [r for r in (v["real"] if v else {}) if len(r) >= MIN_MASK_LEN]
+    if not values or not text:
+        return text
+    lookup = {r.lower(): v["real"][r] for r in values}
+    pattern = "|".join(re.escape(r) for r in sorted(values, key=len, reverse=True))
+    return re.sub(rf"(?<!\w)(?:{pattern})(?!\w)", lambda m: lookup[m.group(0).lower()], text, flags=re.IGNORECASE)
+
+
+def _mask_obj(session_id: str, obj):
+    if isinstance(obj, str):
+        return _mask_text(session_id, obj)
+    if isinstance(obj, dict):
+        return {k: _mask_obj(session_id, x) for k, x in obj.items()}
+    if isinstance(obj, list):
+        return [_mask_obj(session_id, x) for x in obj]
+    return obj
+
+
+def _mask_result(session_id: str, body: str) -> str:
+    """A tool result as the model may see it: every value in a record becomes a placeholder (by field name, so a
+    field the agency adds later is masked too), and any other known value is masked wherever it appears."""
+    parsed = _parse(body)
+    if not parsed:
+        return _mask_text(session_id, body)
+    if isinstance(parsed.get("record"), dict):
+        parsed["record"] = {k: (_placeholder(session_id, k, x) if x not in (None, "") else x)
+                            for k, x in parsed["record"].items()}
+    return json.dumps(_mask_obj(session_id, parsed), ensure_ascii=False)
+
+
+def _restore_text(session_id: str, text: str) -> str:
+    """Put the real values back for placeholders the model wrote."""
+    known = vaults.get(session_id, {}).get("ph", {})
+
+    def put_back(m):
+        if m.group(0) in known:
+            return known[m.group(0)]
+        log.warning("The model used a placeholder that was never issued: %s", m.group(0))
+        return m.group(0)
+    return PLACEHOLDER_RE.sub(put_back, text)
+
+
+def _restore_obj(session_id: str, obj):
+    if isinstance(obj, str):
+        return _restore_text(session_id, obj)
+    if isinstance(obj, dict):
+        return {k: _restore_obj(session_id, x) for k, x in obj.items()}
+    if isinstance(obj, list):
+        return [_restore_obj(session_id, x) for x in obj]
+    return obj
+
+
 def _model_schema(schema: dict, hidden: set) -> dict:
     """The schema the model sees: the agent-supplied parameters are removed."""
     out = copy.deepcopy(schema)
@@ -201,16 +284,20 @@ async def chat(req: ChatRequest):
 async def _chat(req: ChatRequest, session_id: str):
     history = sessions.setdefault(session_id, [])
     start = len(history)
-    history.append({"role": "user", "content": _extract_approvals(session_id, req.message)})
     resident = _bind_resident(session_id, req.context)
+    if resident:    # known values, masked wherever they appear in what the model sees
+        _placeholder(session_id, "RESIDENT_ID", resident["resident_id"])
+        if resident["name"] != "the resident":
+            _placeholder(session_id, "PERSON", resident["name"])
+    history.append({"role": "user", "content": _mask_text(session_id, _extract_approvals(session_id, req.message))})
     hidden = AGENT_SUPPLIED | ({"resident_id"} if resident else set())
     consent_rule = CONSENT_NONE if not REQUIRE_CONSENT else (CONSENT_PORTAL if resident else CONSENT_CMD)
     system = (SYSTEM.replace("{consent_rule}", consent_rule)
               .replace("{approval_rule}", APPROVAL_PORTAL if resident else APPROVAL_CMD)
               .replace("{session_id}", session_id)
-              .replace("{resident_id}", resident["resident_id"] if resident else "<resident_id>"))
+              .replace("{resident_id}", "<resident_id>"))   # only used in command-line mode, where there is no signed-in resident
     if resident:
-        system += RESIDENT_NOTE.format(**resident)
+        system += RESIDENT_NOTE
     tool_calls = []
 
     def unavailable(e: Exception):
@@ -225,7 +312,8 @@ async def _chat(req: ChatRequest, session_id: str):
         except Exception as e:
             return unavailable(e)
         history.append({"role": "assistant", "content": resp.content})
-        return {"response": _text(resp.content), "version": AGENT_VERSION, "tool_calls": tool_calls}
+        return {"response": _restore_text(session_id, _text(resp.content)), "version": AGENT_VERSION,
+                "tool_calls": tool_calls}
 
     # The console's own snippet sends "API-Key"; the proxy's Security tab shows the header it checks.
     # Send both until it is confirmed which one the gateway uses, then drop the other.
@@ -245,7 +333,7 @@ async def _chat(req: ChatRequest, session_id: str):
                         model=MODEL, max_tokens=1000, system=system, tools=tools, messages=history)
                     history.append({"role": "assistant", "content": resp.content})
                     if resp.stop_reason != "tool_use":
-                        answer = _text(resp.content)
+                        answer = _restore_text(session_id, _text(resp.content))
                         if resp.stop_reason == "max_tokens":
                             answer += "\n\n(The reply was cut off. Ask me to continue.)"
                         break
@@ -259,8 +347,10 @@ async def _chat(req: ChatRequest, session_id: str):
                             tool_calls.append({"tool": block.name, "arguments": {}, "result": "blocked by agent"})
                             continue
                         props = full_schemas.get(block.name, {}).get("properties", {})
-                        # Whatever the model sent for agent-supplied parameters is discarded.
-                        args = {k: v for k, v in dict(block.input).items() if k not in hidden}
+                        # Whatever the model sent for agent-supplied parameters is discarded. Placeholders the
+                        # model wrote are replaced by the real values before the call leaves the agent.
+                        args = {k: v for k, v in _restore_obj(session_id, dict(block.input)).items()
+                                if k not in hidden}
                         if "session_id" in props:
                             args["session_id"] = session_id   # always the real session, never model-chosen
                         if resident and "resident_id" in props:
@@ -290,9 +380,12 @@ async def _chat(req: ChatRequest, session_id: str):
                             result = _parse(body)
                             if result.get("ok") or "eID confirmation" in str(result.get("error", "")):
                                 approvals[session_id].remove(approval)
+                            if result.get("ok") and args.get("value"):
+                                _placeholder(session_id, args.get("field", "VALUE"), args["value"])   # now a known value
+                        # The portal gets the real result (it is shown to the resident); the model gets it masked.
                         tool_calls.append({"tool": block.name, "arguments": _redact(args), "result": body})
                         results.append({"type": "tool_result", "tool_use_id": block.id,
-                                        "content": body, "is_error": bool(out.isError)})
+                                        "content": _mask_result(session_id, body), "is_error": bool(out.isError)})
                     history.append({"role": "user", "content": results})
                 if not answer:
                     answer = "I could not finish that request within the allowed number of steps."
