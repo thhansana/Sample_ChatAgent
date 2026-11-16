@@ -16,9 +16,31 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("agent")
 
 app = FastAPI()
-client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.7.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.8.0")
+
+# How the agent reaches Claude. With USE_LLM_PROVIDER=true every model call goes through the Agent Manager AI
+# Gateway (an LLM Service Provider). The gateway holds the real Anthropic key and applies its guardrails (PII
+# masking) before anything leaves for Anthropic. Agent Manager injects LLM_PROVIDER_URL (the provider's invoke URL,
+# e.g. http://default-default.gateway.localhost:19080/anthropic; the SDK adds /v1/messages) and LLM_PROVIDER_KEY
+# (the platform-issued key) when the provider is attached to this agent. Without the flag the agent calls Anthropic
+# directly with ANTHROPIC_API_KEY, as before.
+USE_LLM_PROVIDER = os.getenv("USE_LLM_PROVIDER", "false").strip().lower() in ("1", "true", "yes", "on")
+if USE_LLM_PROVIDER:
+    LLM_URL = (os.getenv("LLM_PROVIDER_URL") or "").split(",")[0].strip().rstrip("/")
+    LLM_KEY = (os.getenv("LLM_PROVIDER_KEY") or "").strip()
+    if not LLM_URL or not LLM_KEY:
+        raise RuntimeError("USE_LLM_PROVIDER is true but LLM_PROVIDER_URL or LLM_PROVIDER_KEY is not set. "
+                           "Attach the LLM Service Provider to this agent in Agent Manager and redeploy.")
+    LLM_AUTH_HEADER = os.getenv("LLM_AUTH_HEADER", "API-Key")   # must match the provider's Security tab
+    # The gateway checks the platform key in the API-Key header. It is also sent as the SDK's api_key
+    # (x-api-key), as in the console snippet; the gateway replaces that with the real Anthropic key upstream.
+    client = anthropic.AsyncAnthropic(api_key=LLM_KEY, base_url=LLM_URL,
+                                      default_headers={LLM_AUTH_HEADER: LLM_KEY})
+    log.info("LLM: through the AI Gateway at %s (auth header %s)", LLM_URL, LLM_AUTH_HEADER)
+else:
+    client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    log.info("LLM: direct to Anthropic. No gateway, so no gateway guardrails.")
 
 # Injected by Agent Manager when the MCP proxy is attached to this agent (names are configurable there).
 # The console may inject several comma-separated URLs; this agent uses the first one.
@@ -268,7 +290,7 @@ def _parse(body: str) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "mcp_configured": bool(MCP_URL)}
+    return {"status": "ok", "mcp_configured": bool(MCP_URL), "llm_via_gateway": USE_LLM_PROVIDER}
 
 
 @app.post("/chat")
