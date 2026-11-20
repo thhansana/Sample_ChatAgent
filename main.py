@@ -17,7 +17,7 @@ log = logging.getLogger("agent")
 
 app = FastAPI()
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.9.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.10.0")
 
 # How the agent reaches Claude. With USE_LLM_PROVIDER=true every model call goes through the Agent Manager AI
 # Gateway (an LLM Service Provider). The gateway holds the real Anthropic key and applies its guardrails (PII
@@ -58,10 +58,11 @@ MAX_STEPS = 6
 # model never chooses or handles them (MCP_SCOPE section 7: the assistant never sees the eID token).
 AGENT_SUPPLIED = {"session_id", "assurance_token", "change_id"}
 
-# When the portal tells us who is signed in (context.resident_id), the agent also fixes resident_id on every
-# tool call and hides it from the model, so the model cannot read or change another resident's records.
-# Without a signed-in resident (for example the Agent Manager "Try it" page) the model supplies it as before.
+# Every chat must come from the portal with a signed-in resident (context.resident_id); a request without one is
+# refused. The agent fixes resident_id on every tool call and hides it from the model, so the model cannot read
+# or change another resident's records.
 RESIDENT_RE = re.compile(r"[A-Za-z0-9-]{1,32}")
+NOT_SIGNED_IN = "Please sign in through the portal to use the assistant."
 # The note deliberately holds no name or ID: the model is an external service and does not need them
 # (the agent fills in resident_id on every call, and the portal greets the resident by name).
 RESIDENT_NOTE = (
@@ -71,9 +72,8 @@ RESIDENT_NOTE = (
 )
 
 # Approvals reach the agent as 'change_id=... assurance_token=...' in a user message: the portal server sends
-# them after the resident approves with their PIN (without the portal, the citizen pastes the lines printed
-# by `demo_tools.py token`). The agent pulls them out before the model sees the message and attaches them
-# to write calls.
+# them after the resident approves with their PIN. The agent pulls them out before the model sees the message
+# and attaches them to write calls.
 APPROVAL_RE = re.compile(r"change_id=(\S+)\s+assurance_token=(\S+)")
 APPROVAL_MARK = "[eID approval received]"
 
@@ -98,9 +98,17 @@ SYSTEM = (
     "- If a tool returns ok=false, report the agency's reason plainly and do not retry with different values."
 )
 
-# How the user gives the eID approval. In the portal a card with the exact change and a PIN field appears by
-# itself when write_field reports 'No eID approval on file'; without the portal the user runs a command.
-APPROVAL_PORTAL = (
+# No consent step: the resident has already signed in, so reading their own records needs no extra approval and
+# a change needs only the eID approval. Without this rule the model sometimes asks for consent on its own.
+CONSENT_RULE = (
+    "Reading the signed-in resident's own records needs no consent or other permission, because they have "
+    "already signed in: never ask for consent, and never say that consent is required. Only changes need an "
+    "approval (below)."
+)
+
+# How the resident gives the eID approval: a card with the exact change and a PIN field appears in the portal by
+# itself when write_field reports 'No eID approval on file'.
+APPROVAL_RULE = (
     "In the portal, the approval card shows the resident the exact change and asks for their eID PIN, so that "
     "card is their confirmation. Once you know the agency, the field and the exact new value, call write_field "
     "straight away; never guess a value. The first write_field call will fail with 'No eID approval on file'. That is expected: "
@@ -110,36 +118,10 @@ APPROVAL_PORTAL = (
     "write_field again with the same values; the system attaches the approval for you. Do not ask for, type "
     "or repeat any token."
 )
-APPROVAL_CMD = (
-    "After the user confirms, give them this command: python3 demo_tools.py token {resident_id} {session_id} "
-    "--count N (N = the number of agencies being changed) and ask them to paste the printed lines into the "
-    "chat. When they do, the message shows as '" + APPROVAL_MARK + "' and the system attaches one approval to "
-    "each write_field call for you. Do not ask for, type or repeat any token. If write_field says no eID "
-    "approval is on file, ask the user to run the token command again and paste it."
-)
 
-# Consent is off by default (the resident is already signed in; only changes need the eID approval). Set
-# REQUIRE_CONSENT=true here AND on the agency services to bring the consent step back.
-REQUIRE_CONSENT = os.getenv("REQUIRE_CONSENT", "false").strip().lower() in ("1", "true", "yes", "on")
-CONSENT_NONE = (
-    "Reading the signed-in resident's own records needs no consent or other permission, because they have "
-    "already signed in: never ask for consent, and never say that consent is required. Only changes need an "
-    "approval (below)."
-)
-# How the user grants consent when it is required. In the portal a consent card appears by itself when a tool
-# reports 'No consent on file'; without the portal (Agent Manager "Try it") the user runs a command.
-CONSENT_PORTAL = (
-    "Reads and writes need the resident's consent. "
-    "If a tool fails with 'No consent on file', tell the user in one or two sentences that a consent request "
-    "is now open in the portal (a window asking them to approve), and that once they "
-    "approve it you will continue. You cannot record consent. Do not tell them to run any command and do "
-    "not retry until they say they have approved."
-)
-CONSENT_CMD = (
-    "Reads and writes need the resident's consent. "
-    "If a tool fails with 'No consent on file', tell the user. You cannot record consent. Give them this "
-    "command to run in WSL: python3 demo_tools.py consent {resident_id} vehicle,elections,tax \"<purpose>\""
-)
+# The full system prompt. It is the same for every request.
+SYSTEM_PROMPT = (SYSTEM.replace("{consent_rule}", CONSENT_RULE)
+                 .replace("{approval_rule}", APPROVAL_RULE)) + RESIDENT_NOTE
 
 sessions: dict[str, list] = {}      # session_id -> message history
 approvals: dict[str, list] = {}     # session_id -> [(change_id, token)], never shown to the model
@@ -305,22 +287,19 @@ async def chat(req: ChatRequest):
 
 
 async def _chat(req: ChatRequest, session_id: str):
+    resident = _bind_resident(session_id, req.context)
+    if not resident:    # only the portal, with a signed-in resident, may use the assistant
+        log.warning("Refused a chat for session %s: no signed-in resident in the request", session_id)
+        return {"response": NOT_SIGNED_IN, "version": AGENT_VERSION, "tool_calls": []}
     history = sessions.setdefault(session_id, [])
     start = len(history)
-    resident = _bind_resident(session_id, req.context)
-    if resident:    # known values, masked wherever they appear in what the model sees
-        _placeholder(session_id, "RESIDENT_ID", resident["resident_id"])
-        if resident["name"] != "the resident":
-            _placeholder(session_id, "PERSON", resident["name"])
+    # Known values, masked wherever they appear in what the model sees
+    _placeholder(session_id, "RESIDENT_ID", resident["resident_id"])
+    if resident["name"] != "the resident":
+        _placeholder(session_id, "PERSON", resident["name"])
     history.append({"role": "user", "content": _mask_text(session_id, _extract_approvals(session_id, req.message))})
-    hidden = AGENT_SUPPLIED | ({"resident_id"} if resident else set())
-    consent_rule = CONSENT_NONE if not REQUIRE_CONSENT else (CONSENT_PORTAL if resident else CONSENT_CMD)
-    system = (SYSTEM.replace("{consent_rule}", consent_rule)
-              .replace("{approval_rule}", APPROVAL_PORTAL if resident else APPROVAL_CMD)
-              .replace("{session_id}", session_id)
-              .replace("{resident_id}", "<resident_id>"))   # only used in command-line mode, where there is no signed-in resident
-    if resident:
-        system += RESIDENT_NOTE
+    hidden = AGENT_SUPPLIED | {"resident_id"}
+    system = SYSTEM_PROMPT
     tool_calls = []
 
     def unavailable(e: Exception):
@@ -372,19 +351,17 @@ async def _chat(req: ChatRequest, session_id: str):
                                 if k not in hidden}
                         if "session_id" in props:
                             args["session_id"] = session_id   # always the real session, never model-chosen
-                        if resident and "resident_id" in props:
+                        if "resident_id" in props:
                             args["resident_id"] = resident["resident_id"]   # always the signed-in resident
                         approval = None
                         if "assurance_token" in props:
                             queue = approvals.get(session_id) or []
                             if not queue:
                                 # The portal looks for this exact start of the message to raise an approval card.
-                                hint = ("An approval request is now waiting for the resident in the portal. "
-                                        "Tell them, and wait until they approve it." if resident else
-                                        "Ask the user to run the token command and paste the printed lines "
-                                        "into the chat.")
+                                # The portal looks for this exact message to raise an approval card.
                                 body = json.dumps({"ok": False, "error": "No eID approval on file for this "
-                                                   "session. " + hint})
+                                                   "session. An approval request is now waiting for the resident "
+                                                   "in the portal. Tell them, and wait until they approve it."})
                                 tool_calls.append({"tool": block.name, "arguments": _redact(args), "result": body})
                                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                                 "content": body, "is_error": True})
