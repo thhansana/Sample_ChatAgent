@@ -17,7 +17,7 @@ log = logging.getLogger("agent")
 
 app = FastAPI()
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.10.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.11.0")
 
 # How the agent reaches Claude. With USE_LLM_PROVIDER=true every model call goes through the Agent Manager AI
 # Gateway (an LLM Service Provider). The gateway holds the real Anthropic key and applies its guardrails (PII
@@ -77,17 +77,14 @@ RESIDENT_NOTE = (
 APPROVAL_RE = re.compile(r"change_id=(\S+)\s+assurance_token=(\S+)")
 APPROVAL_MARK = "[eID approval received]"
 
+# This agent's own rules: its tools, the signed-in resident and the eID approval. The general assistant rules
+# (government services only, no eligibility or legal decisions, say you are an AI, copy placeholders exactly) are
+# not here: the AI Gateway puts them in front of this prompt with the prompt-decorator policy on the meridia-claude
+# provider (text in mcp/gateway/prompt-decorator.txt, JSON Path $.system, Append off).
 SYSTEM = (
-    "You are a government services assistant. Only answer questions about "
-    "government services. Never make eligibility or legal decisions. "
-    "Tell the user you are an AI.\n\n"
-    "You can use tools to read residents' records from State agencies and to change one field. "
+    "\n\nYou can use tools to read residents' records from State agencies and to change one field. "
     "Rules:\n"
     "- {consent_rule}\n"
-    "- Personal details (names, addresses, phone numbers, plates, IDs) appear as placeholders such as "
-    "[ADDRESS_1] or [PHONE_1], in the conversation and in tool results. Write a placeholder exactly as given "
-    "when you mention the detail or pass it to a tool: the system replaces it with the real value for the "
-    "resident. Never guess, invent or change a placeholder, and never mention that placeholders exist.\n"
     "- Always name the agencies as Vehicle Licensing, Elections Office and Revenue Department. The short IDs "
     "(vehicle, elections, tax) are only for tool calls: never say them to the user, and never call a record "
     "the \"tax address\", \"vehicle address\" or \"election address\". Say \"your address at the Revenue "
