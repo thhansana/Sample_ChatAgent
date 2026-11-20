@@ -17,7 +17,7 @@ log = logging.getLogger("agent")
 
 app = FastAPI()
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.8.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.9.0")
 
 # How the agent reaches Claude. With USE_LLM_PROVIDER=true every model call goes through the Agent Manager AI
 # Gateway (an LLM Service Provider). The gateway holds the real Anthropic key and applies its guardrails (PII
@@ -49,8 +49,9 @@ MCP_KEY = (os.getenv("MCP_SERVER_API_KEY") or "").strip() or None
 MCP_AUTH_HEADER = os.getenv("MCP_AUTH_HEADER", "X-API-Key")   # must match the proxy's Security tab
 log.info("MCP proxy URL: %s | API key set: %s", MCP_URL, bool(MCP_KEY))
 
-# The model only ever sees these tools. The gateway policy is the real control; this is a second belt.
-ALLOWED_TOOLS = {"list_agencies", "read_record", "write_field"}
+# Which tools the model may use is decided by the AI Gateway, not here: the MCP proxy's Manage Tools ACL
+# (mcp-acl-list) leaves only list_agencies, read_record and write_field in tools/list and rejects a call to any
+# other tool. The agent offers the model whatever the proxy lists.
 MAX_STEPS = 6
 
 # Tool parameters the agent fills in itself. They are removed from the schema the model sees, so the
@@ -345,10 +346,11 @@ async def _chat(req: ChatRequest, session_id: str):
             async with ClientSession(read, write) as mcp:
                 await mcp.initialize()
                 listed = await mcp.list_tools()
-                full_schemas = {t.name: t.inputSchema for t in listed.tools if t.name in ALLOWED_TOOLS}
+                full_schemas = {t.name: t.inputSchema for t in listed.tools}
                 tools = [{"name": t.name, "description": t.description or "",
                           "input_schema": _model_schema(t.inputSchema, hidden)}
-                         for t in listed.tools if t.name in ALLOWED_TOOLS]
+                         for t in listed.tools]
+                log.info("Tools offered by the MCP proxy: %s", sorted(full_schemas))
                 answer = None
                 for _step in range(MAX_STEPS):
                     resp = await client.messages.create(
@@ -362,11 +364,6 @@ async def _chat(req: ChatRequest, session_id: str):
                     results = []
                     for block in resp.content:
                         if block.type != "tool_use":
-                            continue
-                        if block.name not in ALLOWED_TOOLS:   # never forward a tool the model was not offered
-                            results.append({"type": "tool_result", "tool_use_id": block.id,
-                                            "content": "Tool not available", "is_error": True})
-                            tool_calls.append({"tool": block.name, "arguments": {}, "result": "blocked by agent"})
                             continue
                         props = full_schemas.get(block.name, {}).get("properties", {})
                         # Whatever the model sent for agent-supplied parameters is discarded. Placeholders the
