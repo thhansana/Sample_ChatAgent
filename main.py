@@ -17,7 +17,7 @@ log = logging.getLogger("agent")
 
 app = FastAPI()
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.11.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.12.0")
 
 # How the agent reaches Claude. With USE_LLM_PROVIDER=true every model call goes through the Agent Manager AI
 # Gateway (an LLM Service Provider). The gateway holds the real Anthropic key and applies its guardrails (PII
@@ -63,6 +63,10 @@ AGENT_SUPPLIED = {"session_id", "assurance_token", "change_id"}
 # or change another resident's records.
 RESIDENT_RE = re.compile(r"[A-Za-z0-9-]{1,32}")
 NOT_SIGNED_IN = "Please sign in through the portal to use the assistant."
+# What the resident sees when an AI Gateway guardrail blocks the request. The gateway decides what is blocked;
+# the agent only words the refusal and drops the blocked turn, so the conversation can go on.
+GUARDRAIL_BLOCKED = ("I can't help with that request. Please rephrase it, or ask me about your records at the "
+                     "State agencies.")
 # The note deliberately holds no name or ID: the model is an external service and does not need them
 # (the agent fills in resident_id on every call, and the portal greets the resident by name).
 RESIDENT_NOTE = (
@@ -146,10 +150,34 @@ def _text(content) -> str:
 
 
 def _root(e: BaseException) -> BaseException:
-    """The MCP client wraps errors in ExceptionGroups; dig out the real one."""
-    while getattr(e, "exceptions", None):
-        e = e.exceptions[0]
-    return e
+    """The MCP client and anyio wrap errors in (Base)ExceptionGroups, sometimes next to the GeneratorExit or
+    CancelledError raised while the connection closes. Dig out the first real error."""
+    leaves = []
+
+    def walk(x: BaseException):
+        if isinstance(x, BaseExceptionGroup):
+            for sub in x.exceptions:
+                walk(sub)
+        else:
+            leaves.append(x)
+    walk(e)
+    for x in leaves:
+        if not isinstance(x, (GeneratorExit, asyncio.CancelledError)):
+            return x
+    return leaves[0] if leaves else e
+
+
+def _guardrail(e: BaseException) -> Optional[dict]:
+    """The AI Gateway's verdict when one of its guardrails (for example the prompt-injection regex-guardrail)
+    refused the model call, else None. The gateway answers such a call with an error body like
+    {"type": "REGEX_GUARDRAIL", "message": {"action": "GUARDRAIL_INTERVENED", "interveningGuardrail": ..., ...}}."""
+    if not isinstance(e, anthropic.APIStatusError):
+        return None
+    body = e.body if isinstance(e.body, dict) else {}
+    verdict = body.get("message")
+    if isinstance(verdict, dict) and verdict.get("action") == "GUARDRAIL_INTERVENED":
+        return verdict
+    return None
 
 
 def _redact(args: dict) -> dict:
@@ -299,17 +327,25 @@ async def _chat(req: ChatRequest, session_id: str):
     system = SYSTEM_PROMPT
     tool_calls = []
 
-    def unavailable(e: Exception):
+    def failed(e: BaseException, service: str):
         del history[start:]   # drop the half-finished turn so the next message starts clean
-        return {"response": f"The assistant is unavailable right now ({type(e).__name__}). Please try again.",
-                "version": AGENT_VERSION, "tool_calls": tool_calls}
+        root = _root(e)
+        verdict = _guardrail(root)
+        if verdict:
+            log.warning("AI Gateway guardrail %s blocked the request in session %s: %s",
+                        verdict.get("interveningGuardrail", "?"), session_id, verdict.get("actionReason", ""))
+            text = GUARDRAIL_BLOCKED
+        else:
+            log.error("%s failed: %r", service, root, exc_info=root)
+            text = f"The {service} is unavailable right now ({type(root).__name__}). Please try again."
+        return {"response": text, "version": AGENT_VERSION, "tool_calls": tool_calls}
 
     # No MCP proxy attached yet: behave like the plain chat agent.
     if not MCP_URL:
         try:
             resp = await client.messages.create(model=MODEL, max_tokens=500, system=system, messages=history)
         except Exception as e:
-            return unavailable(e)
+            return failed(e, "assistant")
         history.append({"role": "assistant", "content": resp.content})
         return {"response": _restore_text(session_id, _text(resp.content)), "version": AGENT_VERSION,
                 "tool_calls": tool_calls}
@@ -383,13 +419,10 @@ async def _chat(req: ChatRequest, session_id: str):
                 if not answer:
                     answer = "I could not finish that request within the allowed number of steps."
         return {"response": answer, "version": AGENT_VERSION, "tool_calls": tool_calls}
-    except Exception as e:
-        del history[start:]
-        root = _root(e)
-        log.exception("MCP call failed: %r", root)
-        return {"response": f"The data exchange is unavailable right now ({type(root).__name__}: "
-                            f"{str(root)[:160]}). Please try again.",
-                "version": AGENT_VERSION, "tool_calls": tool_calls}
+    # BaseExceptionGroup too: when the model call fails inside the MCP connection, anyio wraps the error in a
+    # group that also holds the connection's GeneratorExit, and "except Exception" would miss it (HTTP 500).
+    except (Exception, BaseExceptionGroup) as e:
+        return failed(e, "data exchange")
 
 
 if __name__ == "__main__":
