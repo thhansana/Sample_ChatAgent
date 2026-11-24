@@ -17,7 +17,7 @@ log = logging.getLogger("agent")
 
 app = FastAPI()
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "1.12.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "1.12.1")
 
 # How the agent reaches Claude. With USE_LLM_PROVIDER=true every model call goes through the Agent Manager AI
 # Gateway (an LLM Service Provider). The gateway holds the real Anthropic key and applies its guardrails (PII
@@ -150,21 +150,25 @@ def _text(content) -> str:
 
 
 def _root(e: BaseException) -> BaseException:
-    """The MCP client and anyio wrap errors in (Base)ExceptionGroups, sometimes next to the GeneratorExit or
-    CancelledError raised while the connection closes. Dig out the first real error."""
-    leaves = []
-
-    def walk(x: BaseException):
+    """Dig out the first real error. The MCP client and anyio wrap errors in (Base)ExceptionGroups, and while the
+    MCP connection closes it can raise a GeneratorExit or CancelledError of its own. In the deployed agent the error
+    that arrives is a group holding only that GeneratorExit; the real error (for example the gateway's 422) is
+    attached to it as the exception it happened "during handling of" (__context__). So this searches group members
+    and the __cause__/__context__ chain, nearest first, and skips those connection-closing signals."""
+    first_leaf, seen, queue = None, set(), [e]
+    while queue:
+        x = queue.pop(0)
+        if x is None or id(x) in seen:
+            continue
+        seen.add(id(x))
         if isinstance(x, BaseExceptionGroup):
-            for sub in x.exceptions:
-                walk(sub)
-        else:
-            leaves.append(x)
-    walk(e)
-    for x in leaves:
-        if not isinstance(x, (GeneratorExit, asyncio.CancelledError)):
+            queue.extend(x.exceptions)
+        elif not isinstance(x, (GeneratorExit, asyncio.CancelledError)):
             return x
-    return leaves[0] if leaves else e
+        else:
+            first_leaf = first_leaf or x
+        queue.extend((x.__cause__, x.__context__))
+    return first_leaf or e
 
 
 def _guardrail(e: BaseException) -> Optional[dict]:
